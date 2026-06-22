@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Cloudflare Purge (Admin Bar — Portable + Dashboard)
  * Description: Admin Bar actions + Dashboard widget to purge Cloudflare cache. Editors and Authors allowed to Purge. Settings restricted to Admins.
- * Version:     2.3.1 (Modified)
- * Author:      Christopher Sheppard - Segmant Design (Modified for Auth/Editor Access)
+ * Version:     2.3.2
+ * Author:      Salt Media LTD - Christopher Sheppard (chris@saltmedia.co.uk)
  * License:     GPL-2.0+
  */
 
