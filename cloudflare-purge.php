@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Cloudflare Purge (Admin Bar — Portable + Dashboard)
- * Description: Admin Bar actions + Dashboard widget to purge Cloudflare cache. Editors and Authors allowed to Purge. Settings restricted to Admins.
- * Version:     2.3.2
+ * Description: Admin Bar actions + Dashboard widget to purge Cloudflare cache. Editors and Authors allowed to Purge. Settings restricted to Admins. Optional auto-purge on content changes.
+ * Version:     2.4.0
  * Author:      Salt Media LTD - Christopher Sheppard (chris@saltmedia.co.uk)
  * License:     GPL-2.0+
  */
@@ -14,6 +14,18 @@ class CF_AdminBar_Purge_Portable {
     const OPT_ZONE_ID       = 'cf_purge_zone_id';
     const OPT_AUTODISCOVER  = 'cf_purge_autodiscover';
     const TRANS_ZONE_CACHE  = 'cf_purge_zone_auto_%s'; // host-hash
+    const OPT_AUTOPURGE     = 'cf_purge_auto';
+    const OPT_AUTO_LAST     = 'cf_purge_auto_last';
+    const MAX_FILES_PER_CALL = 30; // Cloudflare limit for purge by URL (non-Enterprise)
+
+    /** URLs queued for auto-purge during this request. */
+    private $auto_queue = array();
+    /** Whether this request should purge everything instead of URLs. */
+    private $auto_everything = false;
+    /** Human-readable reason for the queued purge (for the last-result log). */
+    private $auto_reason = '';
+    /** Whether the shutdown handler is registered. */
+    private $auto_shutdown_hooked = false;
 
     public function __construct() {
         add_action( 'admin_bar_menu', array( $this, 'admin_bar' ), 100 );
@@ -31,6 +43,14 @@ class CF_AdminBar_Purge_Portable {
         // Dashboard widget + CSS
         add_action( 'wp_dashboard_setup', array( $this, 'cf_add_dashboard_widget' ) );
         add_action( 'admin_enqueue_scripts', array( $this, 'cf_dashboard_widget_css' ) );
+
+        // Auto-purge on content changes (opt-in per site)
+        if ( $this->auto_enabled() ) {
+            add_action( 'post_updated', array( $this, 'auto_on_post_updated' ), 10, 3 );
+            add_action( 'transition_post_status', array( $this, 'auto_on_transition' ), 10, 3 );
+            add_action( 'elementor/document/after_save', array( $this, 'auto_on_elementor_save' ), 10, 2 );
+            add_action( 'wp_update_nav_menu', array( $this, 'auto_on_menu_update' ) );
+        }
     }
 
     /* ---------------------------
@@ -256,6 +276,190 @@ class CF_AdminBar_Purge_Portable {
     }
 
     /* ---------------------------
+     * Auto-purge on content changes
+     * -------------------------- */
+
+    private function auto_enabled() {
+        if ( defined( 'CF_PURGE_AUTO' ) ) return (bool) CF_PURGE_AUTO;
+        return (bool) get_option( self::OPT_AUTOPURGE, 0 );
+    }
+
+    private function auto_post_is_relevant( $post ) {
+        if ( ! $post instanceof WP_Post ) return false;
+        if ( wp_is_post_revision( $post ) || wp_is_post_autosave( $post ) ) return false;
+        return is_post_type_viewable( $post->post_type );
+    }
+
+    // Old URL of a published post whose slug/parent changed, or that was unpublished/trashed.
+    public function auto_on_post_updated( $post_id, $post_after, $post_before ) {
+        if ( ! $this->auto_post_is_relevant( $post_before ) ) return;
+        if ( $post_before->post_status !== 'publish' ) return;
+
+        $old = get_permalink( $post_before );
+        $new = get_permalink( $post_after );
+        if ( $old && $old !== $new ) {
+            $this->auto_queue_urls( array( $old ), 'URL change: ' . $post_before->post_title );
+        }
+    }
+
+    // Only changes the public can see: publishing, updating a published post, or unpublishing.
+    public function auto_on_transition( $new_status, $old_status, $post ) {
+        if ( ! $post instanceof WP_Post ) return;
+        if ( $new_status !== 'publish' && $old_status !== 'publish' ) return;
+
+        if ( $post->post_type === 'elementor_library' ) {
+            $this->auto_queue_everything( 'Elementor template: ' . $post->post_title );
+            return;
+        }
+        if ( ! $this->auto_post_is_relevant( $post ) ) return;
+
+        $this->auto_queue_urls( $this->auto_urls_for_post( $post ), ucfirst( $post->post_type ) . ': ' . $post->post_title );
+    }
+
+    // Elementor editor saves don't always transition the post status, so hook them directly.
+    public function auto_on_elementor_save( $document, $data ) {
+        if ( ! is_object( $document ) || ! method_exists( $document, 'get_main_id' ) ) return;
+        $post = get_post( $document->get_main_id() );
+        if ( ! $post || $post->post_status !== 'publish' ) return;
+
+        if ( $post->post_type === 'elementor_library' ) {
+            // Headers, footers, popups, kits and saved sections can appear on any page.
+            $this->auto_queue_everything( 'Elementor template: ' . $post->post_title );
+            return;
+        }
+        if ( ! $this->auto_post_is_relevant( $post ) ) return;
+
+        $this->auto_queue_urls( $this->auto_urls_for_post( $post ), 'Elementor: ' . $post->post_title );
+    }
+
+    public function auto_on_menu_update( $menu_id ) {
+        $this->auto_queue_everything( 'Menu updated' );
+    }
+
+    private function auto_urls_for_post( $post ) {
+        $urls = array( get_permalink( $post ), home_url( '/' ) );
+
+        $archive = get_post_type_archive_link( $post->post_type );
+        if ( $archive ) $urls[] = $archive;
+
+        foreach ( get_object_taxonomies( $post->post_type, 'objects' ) as $tax ) {
+            if ( empty( $tax->public ) || empty( $tax->publicly_queryable ) ) continue;
+            $terms = get_the_terms( $post, $tax->name );
+            if ( ! is_array( $terms ) ) continue;
+            foreach ( $terms as $term ) {
+                $link = get_term_link( $term );
+                if ( ! is_wp_error( $link ) ) $urls[] = $link;
+            }
+        }
+
+        /**
+         * Filter the URLs auto-purged when a post changes.
+         *
+         * @param string[] $urls
+         * @param WP_Post  $post
+         */
+        return apply_filters( 'cf_purge_auto_urls', $urls, $post );
+    }
+
+    private function auto_queue_urls( $urls, $reason ) {
+        foreach ( (array) $urls as $url ) {
+            if ( ! is_string( $url ) || $url === '' ) continue;
+            // "https://example.com" and "https://example.com/" are the same cache entry.
+            if ( (string) parse_url( $url, PHP_URL_PATH ) === '' ) $url .= '/';
+            $this->auto_queue[ $url ] = true;
+        }
+        $this->auto_add_reason( $reason );
+        $this->auto_hook_shutdown();
+    }
+
+    private function auto_queue_everything( $reason ) {
+        $this->auto_everything = true;
+        $this->auto_add_reason( $reason );
+        $this->auto_hook_shutdown();
+    }
+
+    private function auto_add_reason( $reason ) {
+        if ( $reason === '' || strpos( $this->auto_reason, $reason ) !== false ) return;
+        $this->auto_reason = $this->auto_reason === '' ? $reason : $this->auto_reason . '; ' . $reason;
+    }
+
+    // One purge per request, however many hooks fired.
+    private function auto_hook_shutdown() {
+        if ( $this->auto_shutdown_hooked ) return;
+        add_action( 'shutdown', array( $this, 'auto_flush' ) );
+        $this->auto_shutdown_hooked = true;
+    }
+
+    public function auto_flush() {
+        if ( ! $this->auto_everything && empty( $this->auto_queue ) ) return;
+
+        $files = array_values( array_unique( array_filter( array_map( 'esc_url_raw', array_keys( $this->auto_queue ) ) ) ) );
+
+        /**
+         * Filter whether an auto-purge should purge everything instead of individual URLs.
+         *
+         * @param bool     $everything
+         * @param string[] $files
+         */
+        $everything = (bool) apply_filters( 'cf_purge_auto_purge_everything', $this->auto_everything, $files );
+
+        if ( $everything ) {
+            $result = $this->api_purge( array( 'purge_everything' => true ) );
+            $scope  = 'everything';
+        } else {
+            $result = true;
+            foreach ( array_chunk( $files, self::MAX_FILES_PER_CALL ) as $chunk ) {
+                $result = $this->api_purge( array( 'files' => $chunk ) );
+                if ( $result !== true ) break;
+            }
+            $scope = sprintf( '%d URL(s)', count( $files ) );
+        }
+
+        update_option( self::OPT_AUTO_LAST, array(
+            'time'   => time(),
+            'scope'  => $scope,
+            'reason' => $this->auto_reason,
+            'ok'     => $result === true,
+            'error'  => $result === true ? '' : (string) $result,
+        ), false );
+
+        if ( $result !== true ) error_log( 'Cloudflare Purge (auto): ' . $result );
+
+        $this->auto_queue      = array();
+        $this->auto_everything = false;
+        $this->auto_reason     = '';
+    }
+
+    /** Returns true on success, or an error message. */
+    private function api_purge( $body ) {
+        $api_token = $this->api_token();
+        $zone_id   = $this->zone_id();
+        if ( empty( $api_token ) ) return 'Missing API Token';
+        if ( empty( $zone_id ) )   return 'Missing Zone ID';
+
+        $response = wp_remote_post(
+            'https://api.cloudflare.com/client/v4/zones/' . rawurlencode( $zone_id ) . '/purge_cache',
+            array(
+                'timeout' => 10,
+                'headers' => array(
+                    'Content-Type'  => 'application/json',
+                    'Authorization' => 'Bearer ' . $api_token,
+                ),
+                'body'    => wp_json_encode( $body ),
+            )
+        );
+
+        if ( is_wp_error( $response ) ) return $response->get_error_message();
+
+        $code = (int) wp_remote_retrieve_response_code( $response );
+        $json = json_decode( wp_remote_retrieve_body( $response ), true );
+
+        if ( $code === 200 && is_array( $json ) && ! empty( $json['success'] ) ) return true;
+        if ( is_array( $json ) && ! empty( $json['errors'] ) ) return wp_json_encode( $json['errors'] );
+        return 'HTTP ' . $code;
+    }
+
+    /* ---------------------------
      * Notices
      * -------------------------- */
 
@@ -331,6 +535,9 @@ class CF_AdminBar_Purge_Portable {
         register_setting( 'cf_purge_group', self::OPT_AUTODISCOVER, array(
             'type' => 'boolean', 'sanitize_callback' => array( $this, 'sanitize_bool' ), 'default' => 0,
         ) );
+        register_setting( 'cf_purge_group', self::OPT_AUTOPURGE, array(
+            'type' => 'boolean', 'sanitize_callback' => array( $this, 'sanitize_bool' ), 'default' => 0,
+        ) );
     }
 
     public function sanitize_token( $v ) { return is_string( $v ) ? trim( $v ) : ''; }
@@ -350,6 +557,9 @@ class CF_AdminBar_Purge_Portable {
         $tok_opt  = get_option( self::OPT_TOKEN, '' );
         $zone_opt = get_option( self::OPT_ZONE_ID, '' );
         $auto_opt = get_option( self::OPT_AUTODISCOVER, 0 );
+        $purge_opt   = get_option( self::OPT_AUTOPURGE, 0 );
+        $purge_const = defined( 'CF_PURGE_AUTO' );
+        $purge_last  = get_option( self::OPT_AUTO_LAST, array() );
 
         $tok_src  = ( defined( 'CF_PURGE_API_TOKEN' ) && CF_PURGE_API_TOKEN ) ? 'constant' : 'db';
         $zone_src = ( defined( 'CF_PURGE_ZONE_ID' ) && CF_PURGE_ZONE_ID ) ? 'constant' : ( $auto_opt ? 'auto' : 'db' );
@@ -391,6 +601,28 @@ class CF_AdminBar_Purge_Portable {
                                 <input type="checkbox" name="<?php echo esc_attr( self::OPT_AUTODISCOVER ); ?>" value="1" <?php checked( $auto_opt, 1 ); ?> />
                                 Find the Zone ID for this site’s domain via API (cached 7 days).
                             </label>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Auto-purge</th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="<?php echo esc_attr( self::OPT_AUTOPURGE ); ?>" value="1" <?php checked( $purge_const ? $this->auto_enabled() : $purge_opt, 1 ); ?> <?php disabled( $purge_const ); ?> />
+                                Purge Cloudflare automatically when content changes.
+                            </label>
+                            <p class="description">Publishing, updating or unpublishing purges that page, the homepage, its archive and its category/tag pages. Saving an Elementor template or a menu purges everything. Turn this on if your Cloudflare cache rule uses a long Edge TTL.</p>
+                            <?php if ( $purge_const ) : ?>
+                                <p class="description">Set by <code>CF_PURGE_AUTO</code> in <code>wp-config.php</code>.</p>
+                            <?php endif; ?>
+                            <?php if ( ! empty( $purge_last['time'] ) ) : ?>
+                                <p class="description">
+                                    <strong>Last auto-purge:</strong>
+                                    <?php echo esc_html( wp_date( 'j M Y H:i:s', (int) $purge_last['time'] ) ); ?> —
+                                    <?php echo esc_html( $purge_last['scope'] ); ?> —
+                                    <?php echo ! empty( $purge_last['ok'] ) ? 'OK' : 'Failed: ' . esc_html( $purge_last['error'] ); ?>
+                                    <?php if ( ! empty( $purge_last['reason'] ) ) : ?><br><em><?php echo esc_html( $purge_last['reason'] ); ?></em><?php endif; ?>
+                                </p>
+                            <?php endif; ?>
                         </td>
                     </tr>
                 </table>
@@ -582,4 +814,5 @@ new CF_AdminBar_Purge_Portable();
  *
  * define('CF_PURGE_API_TOKEN', '...'); // Zone → Cache Purge: Write (and Zone: Read if using autodiscover)
  * define('CF_PURGE_ZONE_ID',   '...'); // to hardcode a Zone ID
+ * define('CF_PURGE_AUTO',      true);  // force auto-purge on/off regardless of the setting
  */
