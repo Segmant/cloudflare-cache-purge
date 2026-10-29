@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Cloudflare Purge (Admin Bar — Portable + Dashboard)
  * Description: Admin Bar actions + Dashboard widget to purge Cloudflare cache. Editors and Authors allowed to Purge. Settings restricted to Admins. Optional auto-purge on content changes.
- * Version:     2.4.0
+ * Version:     2.5.0
  * Author:      Segmant Design - chris@segmant.co.uk - segmant.co.uk
  * License:     GPL-2.0+
  */
@@ -50,6 +50,13 @@ class CF_AdminBar_Purge_Portable {
             add_action( 'transition_post_status', array( $this, 'auto_on_transition' ), 10, 3 );
             add_action( 'elementor/document/after_save', array( $this, 'auto_on_elementor_save' ), 10, 2 );
             add_action( 'wp_update_nav_menu', array( $this, 'auto_on_menu_update' ) );
+
+            // Gravity Forms: editor, settings and add-on saves all write display_meta.
+            add_action( 'gform_post_update_form_meta', array( $this, 'auto_on_gform_meta' ), 10, 3 );
+            add_action( 'gform_post_form_activated', array( $this, 'auto_on_gform_status' ) );
+            add_action( 'gform_post_form_deactivated', array( $this, 'auto_on_gform_status' ) );
+            add_action( 'gform_post_form_trashed', array( $this, 'auto_on_gform_status' ) );
+            add_action( 'gform_post_form_restored', array( $this, 'auto_on_gform_status' ) );
         }
     }
 
@@ -336,6 +343,76 @@ class CF_AdminBar_Purge_Portable {
         $this->auto_queue_everything( 'Menu updated' );
     }
 
+    // A cached page keeps the old form markup and Gravity Forms' state check, so submissions fail until it is purged.
+    public function auto_on_gform_meta( $form_meta, $form_id, $meta_name ) {
+        if ( $meta_name !== 'display_meta' ) return;
+        $this->auto_queue_form( $form_id );
+    }
+
+    public function auto_on_gform_status( $form_id ) {
+        $this->auto_queue_form( $form_id );
+    }
+
+    private function auto_queue_form( $form_id ) {
+        $form_id = absint( $form_id );
+        if ( ! $form_id ) return;
+        $reason = 'Gravity Form #' . $form_id;
+
+        $urls = array();
+        foreach ( $this->auto_posts_with_form( $form_id ) as $post ) {
+            if ( $post->post_type === 'elementor_library' ) {
+                $this->auto_queue_everything( $reason . ' in Elementor template: ' . $post->post_title );
+                return;
+            }
+            if ( $this->auto_post_is_relevant( $post ) ) $urls[] = get_permalink( $post );
+        }
+
+        /**
+         * Filter the URLs auto-purged when a Gravity Form changes.
+         *
+         * @param string[] $urls
+         * @param int      $form_id
+         */
+        $urls = apply_filters( 'cf_purge_auto_form_urls', $urls, $form_id );
+
+        if ( empty( $urls ) ) {
+            // Embedded somewhere we can't see (widget, theme template, another builder).
+            $this->auto_queue_everything( $reason . ' (no page found)' );
+            return;
+        }
+        $this->auto_queue_urls( $urls, $reason );
+    }
+
+    // Published posts embedding the form by shortcode, block or Elementor data.
+    private function auto_posts_with_form( $form_id ) {
+        global $wpdb;
+
+        $rows = $wpdb->get_results(
+            "SELECT ID, post_content AS data FROM {$wpdb->posts}
+             WHERE post_status = 'publish' AND post_type <> 'revision'
+               AND ( post_content LIKE '%[gravityform%' OR post_content LIKE '%wp:gravityforms/form%' )
+             UNION ALL
+             SELECT p.ID, m.meta_value AS data FROM {$wpdb->postmeta} m
+             JOIN {$wpdb->posts} p ON p.ID = m.post_id
+             WHERE m.meta_key = '_elementor_data' AND p.post_status = 'publish' AND p.post_type <> 'revision'
+               AND m.meta_value LIKE '%gravityform%'"
+        );
+
+        $shortcode = '/\[gravityforms?\s[^\]]*\bid=["\']?' . $form_id . '(?![0-9])/';
+        $block     = '/"formId":"?' . $form_id . '(?![0-9])/';
+
+        $posts = array();
+        foreach ( (array) $rows as $row ) {
+            if ( isset( $posts[ $row->ID ] ) ) continue;
+            // Elementor stores JSON, so shortcode quotes arrive as \".
+            $data = str_replace( '\\', '', (string) $row->data );
+            if ( ! preg_match( $shortcode, $data ) && ! preg_match( $block, $data ) ) continue;
+            $post = get_post( $row->ID );
+            if ( $post ) $posts[ $row->ID ] = $post;
+        }
+        return array_values( $posts );
+    }
+
     private function auto_urls_for_post( $post ) {
         $urls = array( get_permalink( $post ), home_url( '/' ) );
 
@@ -610,7 +687,7 @@ class CF_AdminBar_Purge_Portable {
                                 <input type="checkbox" name="<?php echo esc_attr( self::OPT_AUTOPURGE ); ?>" value="1" <?php checked( $purge_const ? $this->auto_enabled() : $purge_opt, 1 ); ?> <?php disabled( $purge_const ); ?> />
                                 Purge Cloudflare automatically when content changes.
                             </label>
-                            <p class="description">Publishing, updating or unpublishing purges that page, the homepage, its archive and its category/tag pages. Saving an Elementor template or a menu purges everything. Turn this on if your Cloudflare cache rule uses a long Edge TTL.</p>
+                            <p class="description">Publishing, updating or unpublishing purges that page, the homepage, its archive and its category/tag pages. Saving an Elementor template or a menu purges everything. Saving a Gravity Form purges the pages it is on (everything if it is in an Elementor template or no page is found). Turn this on if your Cloudflare cache rule uses a long Edge TTL.</p>
                             <?php if ( $purge_const ) : ?>
                                 <p class="description">Set by <code>CF_PURGE_AUTO</code> in <code>wp-config.php</code>.</p>
                             <?php endif; ?>
